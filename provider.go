@@ -1,11 +1,15 @@
 package hawkular
 
 import (
-	"strings"
-
-	"fmt"
-
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/hawkular/hawkular-client-go/metrics"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -34,13 +38,83 @@ type HawkularProvider struct {
 	labelPrefix   string
 }
 
-func New() (*provider.CustomMetricsProvider, error) {
-	// Parse parameters first
-
+func NewHawkularCustomMetricsProvider(client coreclient.CoreV1Interface, uri string) (*provider.CustomMetricsProvider, error) {
 	p := metrics.Parameters{
 		Tenant: "heapster", // TODO We need default tenant configurable
-		// Url:         h.uri.String(),
+		Url:    h.uri.String(),
 		// Concurrency: concurrencyDefault,
+	}
+
+	// Parse parameters first, same uri format as with Heapster & InitialResources
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := hs.uri.Query()
+
+	if v, found := opts["useServiceAccount"]; found {
+		if b, _ := strconv.ParseBool(v[0]); b {
+			// If a readable service account token exists, then use it
+			if contents, err := ioutil.ReadFile(defaultServiceAccountFile); err == nil {
+				p.Token = string(contents)
+			}
+		}
+	}
+
+	// Authentication / Authorization parameters
+	tC := &tls.Config{}
+
+	if v, found := opts["auth"]; found {
+		if _, f := opts["caCert"]; f {
+			return fmt.Errorf("Both auth and caCert files provided, combination is not supported")
+		}
+		if len(v[0]) > 0 {
+			// Authfile
+			kubeConfig, err := kubeClientCmd.NewNonInteractiveDeferredLoadingClientConfig(&kubeClientCmd.ClientConfigLoadingRules{
+				ExplicitPath: v[0]},
+				&kubeClientCmd.ConfigOverrides{}).ClientConfig()
+			if err != nil {
+				return nil, err
+			}
+			tC, err = kube_client.TLSConfigFor(kubeConfig)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if u, found := opts["user"]; found {
+		if _, wrong := opts["useServiceAccount"]; wrong {
+			return fmt.Errorf("If user and password are used, serviceAccount cannot be used")
+		}
+		if p, f := opts["pass"]; f {
+			h.modifiers = append(h.modifiers, func(req *http.Request) error {
+				req.SetBasicAuth(u[0], p[0])
+				return nil
+			})
+		}
+	}
+
+	if v, found := opts["caCert"]; found {
+		caCert, err := ioutil.ReadFile(v[0])
+		if err != nil {
+			return nil, err
+		}
+
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+
+		tC.RootCAs = caCertPool
+	}
+
+	// Concurrency limitations
+	if v, found := opts["concurrencyLimit"]; found {
+		cs, err := strconv.Atoi(v[0])
+		if err != nil || cs < 0 {
+			return fmt.Errorf("Supplied concurrency value of %s is invalid", v[0])
+		}
+		p.Concurrency = cs
 	}
 
 	c, err := metrics.NewHawkularClient(p)
