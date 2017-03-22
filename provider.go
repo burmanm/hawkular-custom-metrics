@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -18,19 +17,24 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/client-go/pkg/api"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/custom-metrics-boilerplate/pkg/provider"
 	"k8s.io/metrics/pkg/apis/custom_metrics"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
+	restclient "k8s.io/client-go/rest"
 )
 
 const (
 	resourceTag               string = "type"
 	descriptorTag             string = "descriptor_name"
 	podLabelsDefaultTagPrefix string = "labels."
+	defaultServiceAccountFile string = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 )
 
-type HawkularProvider struct {
+type hawkularProvider struct {
 	client *metrics.Client
 
 	// TODO Mutex? This could take a while with current API
@@ -38,20 +42,20 @@ type HawkularProvider struct {
 	labelPrefix   string
 }
 
-func NewHawkularCustomMetricsProvider(client coreclient.CoreV1Interface, uri string) (*provider.CustomMetricsProvider, error) {
-	p := metrics.Parameters{
-		Tenant: "heapster", // TODO We need default tenant configurable
-		Url:    h.uri.String(),
-		// Concurrency: concurrencyDefault,
-	}
-
+func NewHawkularCustomMetricsProvider(client coreclient.CoreV1Interface, uri string) (provider.CustomMetricsProvider, error) {
 	// Parse parameters first, same uri format as with Heapster & InitialResources
 	u, err := url.Parse(uri)
 	if err != nil {
 		return nil, err
 	}
 
-	opts := hs.uri.Query()
+	p := metrics.Parameters{
+		Tenant: "heapster", // TODO We need default tenant configurable
+		Url:    u.String(),
+		// Concurrency: concurrencyDefault,
+	}
+
+	opts := u.Query()
 
 	if v, found := opts["useServiceAccount"]; found {
 		if b, _ := strconv.ParseBool(v[0]); b {
@@ -67,17 +71,17 @@ func NewHawkularCustomMetricsProvider(client coreclient.CoreV1Interface, uri str
 
 	if v, found := opts["auth"]; found {
 		if _, f := opts["caCert"]; f {
-			return fmt.Errorf("Both auth and caCert files provided, combination is not supported")
+			return nil, fmt.Errorf("Both auth and caCert files provided, combination is not supported")
 		}
 		if len(v[0]) > 0 {
 			// Authfile
-			kubeConfig, err := kubeClientCmd.NewNonInteractiveDeferredLoadingClientConfig(&kubeClientCmd.ClientConfigLoadingRules{
+			kubeConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(&clientcmd.ClientConfigLoadingRules{
 				ExplicitPath: v[0]},
-				&kubeClientCmd.ConfigOverrides{}).ClientConfig()
+				&clientcmd.ConfigOverrides{}).ClientConfig()
 			if err != nil {
 				return nil, err
 			}
-			tC, err = kube_client.TLSConfigFor(kubeConfig)
+			tC, err = restclient.TLSConfigFor(kubeConfig)
 			if err != nil {
 				return nil, err
 			}
@@ -86,13 +90,11 @@ func NewHawkularCustomMetricsProvider(client coreclient.CoreV1Interface, uri str
 
 	if u, found := opts["user"]; found {
 		if _, wrong := opts["useServiceAccount"]; wrong {
-			return fmt.Errorf("If user and password are used, serviceAccount cannot be used")
+			return nil, fmt.Errorf("If user and password are used, serviceAccount cannot be used")
 		}
-		if p, f := opts["pass"]; f {
-			h.modifiers = append(h.modifiers, func(req *http.Request) error {
-				req.SetBasicAuth(u[0], p[0])
-				return nil
-			})
+		if pass, f := opts["pass"]; f {
+			p.Username = u[0]
+			p.Password = pass[0]
 		}
 	}
 
@@ -112,7 +114,7 @@ func NewHawkularCustomMetricsProvider(client coreclient.CoreV1Interface, uri str
 	if v, found := opts["concurrencyLimit"]; found {
 		cs, err := strconv.Atoi(v[0])
 		if err != nil || cs < 0 {
-			return fmt.Errorf("Supplied concurrency value of %s is invalid", v[0])
+			return nil, fmt.Errorf("Supplied concurrency value of %s is invalid", v[0])
 		}
 		p.Concurrency = cs
 	}
@@ -122,7 +124,7 @@ func NewHawkularCustomMetricsProvider(client coreclient.CoreV1Interface, uri str
 		return nil, err
 	}
 
-	p := &HawkularProvider{
+	hp := &hawkularProvider{
 		client:        c,
 		cachedMetrics: []provider.MetricInfo{},
 		labelPrefix:   podLabelsDefaultTagPrefix, // Make configurable
@@ -130,10 +132,10 @@ func NewHawkularCustomMetricsProvider(client coreclient.CoreV1Interface, uri str
 
 	// Update the cache on the background
 	go func() {
-		p.ListAllMetrics()
+		hp.ListAllMetrics()
 	}()
 
-	return p, nil
+	return hp, nil
 }
 
 /*
@@ -197,7 +199,7 @@ If namespace is used and "metrics"" is the ResourceName, then name is the resour
 */
 
 func valueConverter(dp *metrics.Datapoint, t metrics.MetricType, unit string) (*resource.Quantity, error) {
-	var int64 val
+	var val int64
 	// TODO Reoccurring theme.. this should be handled in the metrics client
 	switch t {
 	case metrics.Counter:
@@ -208,12 +210,12 @@ func valueConverter(dp *metrics.Datapoint, t metrics.MetricType, unit string) (*
 	}
 
 	// TODO Use unit (such as bytes) for the correct measurement scaling
-	return *resource.NewMilliQuantity(value*100, resource.DecimalSI), nil
+	return resource.NewMilliQuantity(val*100, resource.DecimalSI), nil
 }
 
-func definitionToMetricValue(md *metrics.MetricDefinition, groupResource schema.GroupResource) (*custom_metrics.MetricValue, error) {
+func (h *hawkularProvider) definitionToMetricValue(md *metrics.MetricDefinition, groupResource schema.GroupResource) (*custom_metrics.MetricValue, error) {
 	// Fetch async
-	dp, err := h.client.ReadRaw(md.Type, md.ID, metrics.LimitFilter(1), metrics.OrderFilter(metrics.DESC))
+	dp, err := h.client.ReadRaw(md.Type, md.ID, metrics.Filters(metrics.LimitFilter(1), metrics.OrderFilter(metrics.DESC)))
 	if err != nil {
 		return nil, err
 	}
@@ -230,12 +232,12 @@ func definitionToMetricValue(md *metrics.MetricDefinition, groupResource schema.
 			return nil, err
 		}
 
-		val, err := valueConverter(dp[0], d.Type, d.Tags["units"])
+		val, err := valueConverter(dp[0], md.Type, md.Tags["units"])
 		if err != nil {
 			return nil, err
 		}
 
-		custom_metrics.MetricValue{
+		return &custom_metrics.MetricValue{
 			DescribedObject: api.ObjectReference{
 				APIVersion: groupResource.Group + "/" + runtime.APIVersionInternal,
 				Kind:       kind.Kind,
@@ -243,13 +245,13 @@ func definitionToMetricValue(md *metrics.MetricDefinition, groupResource schema.
 				Namespace:  md.Tenant, // Or do we need the id instead of the name?
 			},
 			Timestamp: metav1.Time{dp[0].Timestamp},
-			Value:     val,
-		}
+			Value:     *val,
+		}, nil
 	}
-
+	return &custom_metrics.MetricValue{}, nil
 }
 
-func tagsQueryBuilder(groupResource schema.GroupResource, selector labels.Selector, metricName string) metrics.TagsQueryFilter {
+func (h *hawkularProvider) tagsQueryFilter(groupResource schema.GroupResource, selector labels.Selector, metricName string) metrics.Filter {
 	var buffer bytes.Buffer
 	buffer.WriteString(fmt.Sprintf("%s = %s AND %s = %s", descriptorTag, metricName, resourceTag, groupResource.Resource))
 
@@ -261,15 +263,15 @@ func tagsQueryBuilder(groupResource schema.GroupResource, selector labels.Select
 	return metrics.TagsQueryFilter(buffer.String())
 }
 
-func (h *HawkularProvider) GetRootScopedMetricByName(groupResource schema.GroupResource, name string, metricName string) (*custom_metrics.MetricValue, error) {
-
+func (h *hawkularProvider) GetRootScopedMetricByName(groupResource schema.GroupResource, name string, metricName string) (*custom_metrics.MetricValue, error) {
+	return nil, nil
 }
 
 // GetRootScopedMetricBySelector fetches a particular metric for a set of root-scoped objects
 // matching the given label selector.
-func (h *HawkularProvider) GetRootScopedMetricBySelector(groupResource schema.GroupResource, selector labels.Selector, metricName string) (*custom_metrics.MetricValueList, error) {
+func (h *hawkularProvider) GetRootScopedMetricBySelector(groupResource schema.GroupResource, selector labels.Selector, metricName string) (*custom_metrics.MetricValueList, error) {
 	// We fetch definitions first to be able to do manual label selection for procedures we don't support
-	defs, err := h.client.Definitions(tagsQueryBuilder(groupResource, selector, metricName))
+	defs, err := h.client.Definitions(metrics.Filters(h.tagsQueryFilter(groupResource, selector, metricName)))
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +288,11 @@ func (h *HawkularProvider) GetRootScopedMetricBySelector(groupResource schema.Gr
 	// Fetch the requested values
 	// TODO Turn into its own function to allow reuse
 	for _, d := range defs {
-		mv = append(mv, definitionToMetricValue(d, groupResource))
+		dmv, err := h.definitionToMetricValue(d, groupResource)
+		if err != nil {
+			return nil, err
+		}
+		mv = append(mv, *dmv)
 	}
 
 	return &custom_metrics.MetricValueList{
@@ -295,16 +301,17 @@ func (h *HawkularProvider) GetRootScopedMetricBySelector(groupResource schema.Gr
 }
 
 // GetNamespacedMetricByName fetches a particular metric for a particular namespaced object.
-func (h *HawkularProvider) GetNamespacedMetricByName(groupResource schema.GroupResource, namespace string, name string, metricName string) (*custom_metrics.MetricValue, error) {
+func (h *hawkularProvider) GetNamespacedMetricByName(groupResource schema.GroupResource, namespace string, name string, metricName string) (*custom_metrics.MetricValue, error) {
 	// TODO How are we going to select the metricName here properly? How are we storing the metric?
 	// if name is * we do something and if "metrics" something else.. or ?
+	return nil, nil
 }
 
 // GetNamespacedMetricBySelector fetches a particular metric for a set of namespaced objects
 // matching the given label selector.
-func (h *HawkularProvider) GetNamespacedMetricBySelector(groupResource schema.GroupResource, namespace string, selector labels.Selector, metricName string) (*custom_metrics.MetricValueList, error) {
+func (h *hawkularProvider) GetNamespacedMetricBySelector(groupResource schema.GroupResource, namespace string, selector labels.Selector, metricName string) (*custom_metrics.MetricValueList, error) {
 	// We fetch definitions first to be able to do manual label selection for procedures we don't support
-	defs, err := h.client.Definitions(metrics.Tenant(namespace), tagsQueryBuilder(groupResource, selector, metricName))
+	defs, err := h.client.Definitions(metrics.Tenant(namespace), metrics.Filters(h.tagsQueryFilter(groupResource, selector, metricName)))
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +323,11 @@ func (h *HawkularProvider) GetNamespacedMetricBySelector(groupResource schema.Gr
 	// Fetch the requested values
 	// TODO Turn into its own function to allow reuse
 	for _, d := range defs {
-		mv = append(mv, definitionToMetricValue(d, groupResource))
+		dmv, err := h.definitionToMetricValue(d, groupResource)
+		if err != nil {
+			return nil, err
+		}
+		mv = append(mv, *dmv)
 	}
 
 	return &custom_metrics.MetricValueList{
@@ -328,7 +339,7 @@ func (h *HawkularProvider) GetNamespacedMetricBySelector(groupResource schema.Gr
 // the current time.  Note that this is not allowed to return
 // an error, so it is reccomended that implementors cache and
 // periodically update this list, instead of querying every time.
-func (h *HawkularProvider) ListAllMetrics() []provider.MetricInfo {
+func (h *hawkularProvider) ListAllMetrics() []provider.MetricInfo {
 	q := make(map[string]string)
 
 	q[resourceTag] = "*"
@@ -338,13 +349,13 @@ func (h *HawkularProvider) ListAllMetrics() []provider.MetricInfo {
 		// Return cached version
 		return h.cachedMetrics
 	}
+	delete(q, resourceTag)
 
 	// Seek all the available metricNames for each type
 	q[descriptorTag] = "*"
-
 	providers := make([]provider.MetricInfo, 0, len(types))
+
 	for _, v := range types[resourceTag] {
-		del(q, resourceTag)
 		q[resourceTag] = v
 		names, err := h.client.TagValues(q)
 		if err != nil {
@@ -364,37 +375,41 @@ func (h *HawkularProvider) ListAllMetrics() []provider.MetricInfo {
 	return providers
 }
 
-func quoteValues(vals []string) string {
+func quoteValues(vals sets.String) string {
 	quotedVals := make([]string, 0, len(vals))
-	for _, val := range vals {
+	for val, _ := range vals {
 		quotedVals = append(quotedVals, fmt.Sprintf("'%s'", val))
 	}
 	return strings.Join(quotedVals, ",")
 }
 
 // labelSelectorToHawkularTagsQuery transforms labels.Selector to Hawkular's TagQL (new style)
-func (h *HawkularProvider) labelSelectorToHawkularTagsQuery(selector labels.Selector) string {
-	reqs := selector.Requirements()
+func (h *hawkularProvider) labelSelectorToHawkularTagsQuery(selector labels.Selector) string {
+	reqs, selectable := selector.Requirements()
+	if !selectable {
+		return ""
+	}
+
 	queries := make([]string, 0, len(reqs))
 	// postReq := make([]selector.Requirement)
 
 	for _, req := range reqs {
-		key := fmt.Sprintf("%s%s", h.labelPrefix, req.Key)
-		switch req.operator {
+		key := fmt.Sprintf("%s%s", h.labelPrefix, req.Key())
+		switch req.Operator() {
 		case selection.In:
-			queries = append(queries, fmt.Sprintf("%s IN [%s]", key, quoteValues(req.Values)))
+			queries = append(queries, fmt.Sprintf("%s IN [%s]", key, quoteValues(req.Values())))
 		case selection.NotIn:
-			queries = append(queries, fmt.Sprintf("%s NOT IN [%s]", key, quoteValues(req.Values)))
+			queries = append(queries, fmt.Sprintf("%s NOT IN [%s]", key, quoteValues(req.Values())))
 		case selection.Equals, selection.DoubleEquals:
 			// More than one value would make no sense, use IN
-			queries = append(queries, fmt.Sprintf("%s = '%s'", key, req.Values[0]))
+			queries = append(queries, fmt.Sprintf("%s = '%s'", key, req.Values().List()[0]))
 		case selection.DoesNotExist:
 			queries = append(queries, fmt.Sprintf("NOT %s", key))
 		case selection.NotEquals:
 			// More than one value would make no sense, use NOT IN
-			queries = append(queries, fmt.Sprintf("%s != '%s'", key, reasdsaq.Values[0]))
+			queries = append(queries, fmt.Sprintf("%s != '%s'", key, req.Values().List()[0]))
 		case selection.Exists:
-			queries = append(queries, req.Key)
+			queries = append(queries, req.Key())
 		case selection.GreaterThan, selection.LessThan:
 			// These are not supported (Hawkular tags are string typed), need manual filtering
 			// We could return a function for "post-processing" that would be run after fetching the definitions?
