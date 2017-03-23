@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package hawkular
+package main
 
 import (
 	"flag"
@@ -23,22 +23,20 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/hawkular/hawkular-custom-metrics/pkg/hawkular"
+	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/util/logs"
-	"k8s.io/custom-metrics-boilerplate/pkg/sample-cmd/server"
-
-	"github.com/spf13/cobra"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/custom-metrics-boilerplate/pkg/cmd/server"
-	"k8s.io/custom-metrics-boilerplate/pkg/sample-cmd/provider"
 )
 
 // NewCommandStartMaster provides a CLI handler for 'start master' command
 func NewCommandStartAdapterServer(out, errOut io.Writer, stopCh <-chan struct{}) *cobra.Command {
 	baseOpts := server.NewCustomMetricsAdapterServerOptions(out, errOut)
-	o := SampleAdapterServerOptions{
+	o := HawkularAdapterServerOptions{
 		CustomMetricsAdapterServerOptions: baseOpts,
 	}
 
@@ -75,7 +73,7 @@ func NewCommandStartAdapterServer(out, errOut io.Writer, stopCh <-chan struct{})
 	return cmd
 }
 
-func (o SampleAdapterServerOptions) RunCustomMetricsAdapterServer(stopCh <-chan struct{}) error {
+func (o HawkularAdapterServerOptions) RunCustomMetricsAdapterServer(stopCh <-chan struct{}) error {
 	config, err := o.Config()
 	if err != nil {
 		return err
@@ -99,7 +97,10 @@ func (o SampleAdapterServerOptions) RunCustomMetricsAdapterServer(stopCh <-chan 
 		return fmt.Errorf("unable to construct lister client to initialize provider: %v", err)
 	}
 
-	cmProvider := provider.NewFakeProvider(client)
+	cmProvider, err := hawkular.NewHawkularCustomMetricsProvider(client, o.HawkularConfigUri)
+	if err != nil {
+		return err
+	}
 
 	server, err := config.Complete().New(cmProvider)
 	if err != nil {
@@ -108,7 +109,7 @@ func (o SampleAdapterServerOptions) RunCustomMetricsAdapterServer(stopCh <-chan 
 	return server.GenericAPIServer.PrepareRun().Run(stopCh)
 }
 
-type SampleAdapterServerOptions struct {
+type HawkularAdapterServerOptions struct {
 	*server.CustomMetricsAdapterServerOptions
 
 	// RemoteKubeConfigFile is the config used to list pods from the master API server
@@ -124,7 +125,7 @@ func main() {
 		runtime.GOMAXPROCS(runtime.NumCPU())
 	}
 
-	cmd := server.NewCommandStartAdapterServer(os.Stdout, os.Stderr, wait.NeverStop)
+	cmd := NewCommandStartAdapterServer(os.Stdout, os.Stderr, wait.NeverStop)
 	cmd.Flags().AddGoFlagSet(flag.CommandLine)
 	if err := cmd.Execute(); err != nil {
 		panic(err)
