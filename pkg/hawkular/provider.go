@@ -29,7 +29,9 @@ import (
 
 const (
 	resourceTag               string = "type"
-	descriptorTag             string = "descriptor_name"
+	resourceNameTag           string = "name"
+	metricNameTag             string = "metric_name"
+	nameTag                   string = "pod_name"
 	podLabelsDefaultTagPrefix string = "labels."
 	defaultServiceAccountFile string = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 )
@@ -169,6 +171,8 @@ func NewHawkularCustomMetricsProvider(client coreclient.CoreV1Interface, uri str
 */
 
 /*
+// https://github.com/hawkular/hawkular-openshift-agent/blob/master/deploy/openshift/hawkular-openshift-agent-configmap.yaml#L27-L43
+
 GET /apis/custom-metrics/v1alpha1/namespaces/webapp/ingress.extensions//hits-per-second?labelSelector=app%3Dfrontend`
 
 ---
@@ -241,7 +245,7 @@ func (h *hawkularProvider) definitionToMetricValue(md *metrics.MetricDefinition,
 			DescribedObject: api.ObjectReference{
 				APIVersion: groupResource.Group + "/" + runtime.APIVersionInternal,
 				Kind:       kind.Kind,
-				Name:       md.Tags[descriptorTag],
+				Name:       md.Tags[metricNameTag],
 				Namespace:  md.Tenant, // Or do we need the id instead of the name?
 			},
 			Timestamp: metav1.Time{dp[0].Timestamp},
@@ -251,9 +255,13 @@ func (h *hawkularProvider) definitionToMetricValue(md *metrics.MetricDefinition,
 	return &custom_metrics.MetricValue{}, nil
 }
 
+func (h *hawkularProvider) nameTagsQueryFilter(groupResource schema.GroupResource, name string, metricName string) metrics.Filter {
+	return metrics.TagsQueryFilter(fmt.Sprintf("%s = %s AND %s = %s AND %s = %s", metricNameTag, metricName, nameTag, name, resourceTag, groupResource.Resource))
+}
+
 func (h *hawkularProvider) tagsQueryFilter(groupResource schema.GroupResource, selector labels.Selector, metricName string) metrics.Filter {
 	var buffer bytes.Buffer
-	buffer.WriteString(fmt.Sprintf("%s = %s AND %s = %s", descriptorTag, metricName, resourceTag, groupResource.Resource))
+	buffer.WriteString(fmt.Sprintf("%s = %s AND %s = %s", metricNameTag, metricName, resourceTag, groupResource.Resource))
 
 	if !selector.Empty() {
 		buffer.WriteString(" AND ")
@@ -263,8 +271,33 @@ func (h *hawkularProvider) tagsQueryFilter(groupResource schema.GroupResource, s
 	return metrics.TagsQueryFilter(buffer.String())
 }
 
+func (h *hawkularProvider) definitionsToMetricValues(defs []*metrics.MetricDefinition, groupResource schema.GroupResource) ([]custom_metrics.MetricValue, error) {
+	mv := make([]custom_metrics.MetricValue, 0, len(defs))
+
+	// Fetch the requested values
+	for _, d := range defs {
+		dmv, err := h.definitionToMetricValue(d, groupResource)
+		if err != nil {
+			return nil, err
+		}
+		mv = append(mv, *dmv)
+	}
+	return mv, nil
+}
+
 func (h *hawkularProvider) GetRootScopedMetricByName(groupResource schema.GroupResource, name string, metricName string) (*custom_metrics.MetricValue, error) {
-	return nil, nil
+	// name = pod_name?
+	defs, err := h.client.Definitions(metrics.Filters(h.nameTagsQueryFilter(groupResource, name, metricName)))
+	if err != nil {
+		return nil, err
+	}
+
+	mv, err := h.definitionsToMetricValues(defs, groupResource) // Maybe I should've handled the groupResource some other way?
+	if err != nil {
+		return nil, err
+	}
+
+	return &mv[0], nil
 }
 
 // GetRootScopedMetricBySelector fetches a particular metric for a set of root-scoped objects
@@ -282,17 +315,9 @@ func (h *hawkularProvider) GetRootScopedMetricBySelector(groupResource schema.Gr
 	// We can request rates for each metric if we wanted, but when is it necessary? There's no specifications or metadata to make that selection.
 	// For example, are counter types always with rate and gauge with always exact? There are situations where "gauges" can actually give some rate, such as
 	// filesystem usage growth rate (while filesystem usage is actually a gauge metric)
-
-	mv := make([]custom_metrics.MetricValue, 0, len(defs))
-
-	// Fetch the requested values
-	// TODO Turn into its own function to allow reuse
-	for _, d := range defs {
-		dmv, err := h.definitionToMetricValue(d, groupResource)
-		if err != nil {
-			return nil, err
-		}
-		mv = append(mv, *dmv)
+	mv, err := h.definitionsToMetricValues(defs, groupResource) // Maybe I should've handled the groupResource some other way?
+	if err != nil {
+		return nil, err
 	}
 
 	return &custom_metrics.MetricValueList{
@@ -302,32 +327,30 @@ func (h *hawkularProvider) GetRootScopedMetricBySelector(groupResource schema.Gr
 
 // GetNamespacedMetricByName fetches a particular metric for a particular namespaced object.
 func (h *hawkularProvider) GetNamespacedMetricByName(groupResource schema.GroupResource, namespace string, name string, metricName string) (*custom_metrics.MetricValue, error) {
-	// TODO How are we going to select the metricName here properly? How are we storing the metric?
-	// if name is * we do something and if "metrics" something else.. or ?
-	return nil, nil
+	defs, err := h.client.Definitions(metrics.Tenant(namespace), metrics.Filters(h.nameTagsQueryFilter(groupResource, name, metricName)))
+	if err != nil {
+		return nil, err
+	}
+
+	mv, err := h.definitionsToMetricValues(defs, groupResource) // Maybe I should've handled the groupResource some other way?
+	if err != nil {
+		return nil, err
+	}
+
+	return &mv[0], nil
 }
 
 // GetNamespacedMetricBySelector fetches a particular metric for a set of namespaced objects
 // matching the given label selector.
 func (h *hawkularProvider) GetNamespacedMetricBySelector(groupResource schema.GroupResource, namespace string, selector labels.Selector, metricName string) (*custom_metrics.MetricValueList, error) {
-	// We fetch definitions first to be able to do manual label selection for procedures we don't support
 	defs, err := h.client.Definitions(metrics.Tenant(namespace), metrics.Filters(h.tagsQueryFilter(groupResource, selector, metricName)))
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO Refactor following to reusable function (copy from other methods) as soon as name versioned ones are implemented
-
-	mv := make([]custom_metrics.MetricValue, 0, len(defs))
-
-	// Fetch the requested values
-	// TODO Turn into its own function to allow reuse
-	for _, d := range defs {
-		dmv, err := h.definitionToMetricValue(d, groupResource)
-		if err != nil {
-			return nil, err
-		}
-		mv = append(mv, *dmv)
+	mv, err := h.definitionsToMetricValues(defs, groupResource) // Maybe I should've handled the groupResource some other way?
+	if err != nil {
+		return nil, err
 	}
 
 	return &custom_metrics.MetricValueList{
@@ -352,7 +375,7 @@ func (h *hawkularProvider) ListAllMetrics() []provider.MetricInfo {
 	delete(q, resourceTag)
 
 	// Seek all the available metricNames for each type
-	q[descriptorTag] = "*"
+	q[metricNameTag] = "*"
 	providers := make([]provider.MetricInfo, 0, len(types))
 
 	for _, v := range types[resourceTag] {
@@ -362,7 +385,7 @@ func (h *hawkularProvider) ListAllMetrics() []provider.MetricInfo {
 			// Return cached version
 			return h.cachedMetrics
 		}
-		for _, name := range names[descriptorTag] {
+		for _, name := range names[metricNameTag] {
 			providers = append(providers, provider.MetricInfo{
 				GroupResource: schema.GroupResource{Group: "", Resource: v},
 				Metric:        name,
